@@ -1,0 +1,38 @@
+# pip install openai
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:1234/v1",  # LM Studio 本機伺服器
+    api_key="lm-studio"                   # 隨意字串即可（視設定而定）
+)
+
+MODEL = "openai/gpt-oss-20b"
+
+history = [
+    {
+        "role": "system",
+        "content": (
+            "你是專業的中文助理，請全程使用 繁體中文（台灣）回覆，"
+            "用詞與標點採台灣慣用法，除非明確要求其他語言或格式。"
+        ),
+    },
+]
+
+try:
+    while True:
+        user = input("你：").strip()
+        if not user or user.lower() in {"exit", "quit"} or user in {"離開", "結束", "退出"}:
+            break
+        history.append({"role": "user", "content": user})
+
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=history,
+            temperature=0.7
+        )
+        answer = resp.choices[0].message.content
+        print("助理：", answer)
+        history.append({"role": "assistant", "content": answer})
+except (KeyboardInterrupt, EOFError):
+    print("\n已結束。")
+
