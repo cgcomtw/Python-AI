@@ -1,0 +1,57 @@
+# === 自動安裝必要套件 ===
+import os, sys, subprocess
+
+def ensure_package(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"🔧 未偵測到套件：{pkg}，正在安裝中...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        print(f"已成功安裝 {pkg}\n")
+
+ensure_package("openai")
+
+# === 匯入套件 ===
+from openai import OpenAI
+
+# === Ollama 設定 ===
+client = OpenAI(
+    base_url="http://127.0.0.1:11434/v1",  # Ollama 本機 API
+    api_key="ollama"                       # 形式上仍需填字串，實際不檢查
+)
+
+MODEL = "gemma3:1b"
+
+# === 系統提示 ===
+history = [
+    {
+        "role": "system",
+        "content": (
+            "你是專業的中文助理，請全程使用繁體中文（台灣）回覆，"
+            "用詞與標點採台灣慣用法，除非明確要求其他語言或格式。"
+        ),
+    },
+]
+
+# === 互動主迴圈 ===
+try:
+    while True:
+        user = input("你：").strip()
+        if not user or user.lower() in {"exit", "quit"} or user in {"離開", "結束", "退出"}:
+            print("已離開對話。")
+            break
+
+        history.append({"role": "user", "content": user})
+
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=history,
+            temperature=0.7
+        )
+
+        answer = resp.choices[0].message.content
+        print("助理：", answer)
+        history.append({"role": "assistant", "content": answer})
+
+except (KeyboardInterrupt, EOFError):
+    print("\n使用者中斷，程式結束。")
