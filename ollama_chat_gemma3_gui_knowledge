@@ -1,0 +1,391 @@
+import os, sys, subprocess, html, traceback, glob, re
+
+# ---------- 自動安裝套件 ----------
+def ensure_package(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"未偵測到套件：{pkg}，正在安裝中...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        print(f"成功安裝 {pkg}\n")
+
+ensure_package("PySide6")
+ensure_package("openai")
+
+# ---------- 匯入套件 ----------
+from openai import OpenAI
+from PySide6.QtCore import Qt, QThread, Signal, QEvent
+from PySide6.QtGui import QAction, QKeySequence, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout,
+    QLabel, QMessageBox, QFileDialog
+)
+
+# ---------- Ollama / OpenAI 相容設定 ----------
+client = OpenAI(
+    base_url="http://127.0.0.1:11434/v1",  # Ollama 本機 API
+    api_key="ollama"
+)
+MODEL = "gemma3:1b"
+
+# ---------- 知識/人設檔設定 ----------
+KNOWLEDGE_DIR = "knowledge"
+PERSONA_FILE = os.path.join(KNOWLEDGE_DIR, "persona.txt")
+KNOWLEDGE_TOTAL_MAX_CHARS = 20000
+KNOWLEDGE_PER_FILE_MAX_CHARS = 6000
+
+# 是否每回合都帶入（建議 True 最穩）
+ALWAYS_INCLUDE_CONTEXT = True
+
+# ---------- 規範與 fallback ----------
+LANG_RULE = "所有回覆一律使用繁體中文（台灣），用詞與標點採台灣慣用法。"
+FALLBACK_PERSONA = (
+    "【角色】我是「CG百貨」的親切服務台小姐（虛擬助理）。\n"
+    "【口吻】禮貌、簡潔、主動引導。\n"
+    "【自我介紹模板】您好，我是CG百貨的服務台小姐，很高興為您服務。請問想找哪個樓層或服務呢？"
+)
+BOUNDARY_RULES = (
+    "【邊界規則】\n"
+    "1) 僅能依據提供的百貨樓層/品牌/服務/動線/營業時間/停車/客服等資訊作答，禁止杜撰。\n"
+    "2) 若超出範圍或知識中查無，請婉拒並引導回可回答主題："
+    "「很抱歉，我目前只能提供本百貨的樓層與服務資訊。是否要我幫您查詢某個樓層或服務？」\n"
+    "3) 被問到身分或開發單位時，須依 persona.txt 自介，不得自稱 AI/大型語言模型/Google/OpenAI 等。"
+)
+
+# ---------- 後處理：偵測身分漂移的關鍵詞 ----------
+IDENTITY_DRIFT_PATTERNS = [
+    r"我是.*(AI|人工智慧|大型語言模型)",
+    r"由.*(Google|OpenAI|Meta|微軟).*訓練",
+    r"(Google|OpenAI|Meta|Microsoft).*開發",
+    r"作為.*模型",
+]
+
+# ========== 後台工作執行緒 ==========
+class ChatWorker(QThread):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, payload_messages, parent=None):
+        super().__init__(parent)
+        self._payload = list(payload_messages)
+
+    def run(self):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=self._payload,
+                temperature=0.0,   # 更保守
+                top_p=0.9
+            )
+            answer = resp.choices[0].message.content
+            self.finished.emit(answer)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.failed.emit(f"{e}\n{tb}")
+
+# ========== 主視窗 ==========
+class ChatWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI 助理（PySide6 + Ollama/OpenAI API）")
+        self.resize(600, 800)
+
+        # 真實對話歷史（不含 system/few-shot）
+        self.history = []
+        self._busy = False
+        self._worker = None
+
+        # 基底上下文（每回合重複帶）
+        self._base_system = ""     # 長版：語言 + persona + 邊界 + 知識
+        self._short_persona = ""   # 短版：<=200字核心人設，每回合都加
+        self._fewshot = []         # few-shot
+        self._intro_template = ""  # 自介模板（也用於後處理漂移修正）
+
+        # 角色圖片區
+        self.avatar_label = QLabel("（尚未載入角色圖片）")
+        self.avatar_label.setAlignment(Qt.AlignCenter)
+        self.avatar_label.setFixedHeight(160)
+        self.avatar_label.setStyleSheet("border: 1px dashed #666; color: #888; font-size: 14px;")
+
+        # 對話顯示
+        self.chat_view = QTextEdit()
+        self.chat_view.setReadOnly(True)
+        self.chat_view.setPlaceholderText("這裡會顯示對話內容…")
+        self.chat_view.setStyleSheet("font-size: 14px;")
+
+        # 輸入區
+        self.input_edit = QTextEdit()
+        self.input_edit.setPlaceholderText("輸入訊息…（Enter 送出，Shift+Enter 換行）")
+        self.input_edit.setFixedHeight(120)
+        self.input_edit.setStyleSheet("font-size: 14px;")
+        self.input_edit.installEventFilter(self)
+
+        # 按鈕列
+        self.send_btn = QPushButton("送出")
+        self.clear_btn = QPushButton("清除對話")
+        self.load_img_btn = QPushButton("載入角色圖片…")
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.load_img_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addWidget(self.send_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.avatar_label)
+        layout.addWidget(self.chat_view, 1)
+        layout.addWidget(self.input_edit)
+        layout.addLayout(btn_row)
+
+        send_action = QAction(self)
+        send_action.setShortcut(QKeySequence(Qt.CTRL | Qt.Key_Return))
+        send_action.triggered.connect(self.on_send_clicked)
+        self.addAction(send_action)
+
+        self.send_btn.clicked.connect(self.on_send_clicked)
+        self.clear_btn.clicked.connect(self.on_clear_clicked)
+        self.load_img_btn.clicked.connect(self.on_load_image)
+
+        # 準備 context 並主動自介
+        self._prepare_base_context()
+        self._opening_greeting()
+
+    # ---- 事件過濾（Enter 送出 / Shift+Enter 換行）----
+    def eventFilter(self, obj, event):
+        if obj is self.input_edit and event.type() == QEvent.KeyPress:
+            key = event.key()
+            mods = event.modifiers()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if mods & Qt.ShiftModifier:
+                    return False
+                else:
+                    self.on_send_clicked()
+                    return True
+        return super().eventFilter(obj, event)
+
+    # ---- UI 輔助 ----
+    def append_user(self, text: str):
+        safe = html.escape(text).replace("\n", "<br>")
+        self.chat_view.append(f"<p><b>你：</b><br>{safe}</p>")
+        self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
+
+    def append_assistant(self, text: str):
+        safe = html.escape(text).replace("\n", "<br>")
+        self.chat_view.append(f"<p style='color:#1a73e8;'><b>助理：</b><br>{safe}</p>")
+        self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
+
+    def append_system(self, text: str):
+        safe = html.escape(text).replace("\n", "<br>")
+        self.chat_view.append(f"<p style='color:#888;'><i>{safe}</i></p>")
+
+    # ---- 載入角色圖片 ----
+    def on_load_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "選擇角色圖片", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
+        if path:
+            pix = QPixmap(path)
+            if pix.isNull():
+                QMessageBox.warning(self, "載入失敗", "無法讀取這張圖片。")
+                return
+            scaled = pix.scaledToHeight(150, Qt.SmoothTransformation)
+            self.avatar_label.setPixmap(scaled)
+            self.avatar_label.setText("")
+
+    # ---- 清除對話 ----
+    def on_clear_clicked(self):
+        self.chat_view.clear()
+        self.history = []
+        self._prepare_base_context()
+        self._opening_greeting()
+
+    # ---- 準備 base system + short persona + few-shot ----
+    def _prepare_base_context(self):
+        os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+        persona_txt = self._load_persona_text()
+        self._short_persona = self._make_short_persona(persona_txt)
+
+        knowledge_txt, used = self._load_all_knowledge_texts()
+
+        combined = LANG_RULE + "\n\n" + persona_txt.strip() + "\n\n" + BOUNDARY_RULES
+        if knowledge_txt:
+            combined += "\n\n" + knowledge_txt + "\n"
+        self._base_system = combined
+
+        if used:
+            self.append_system(f"已載入知識檔（{len(used)}）：{'、'.join(used)}")
+            if len(knowledge_txt or "") >= KNOWLEDGE_TOTAL_MAX_CHARS:
+                self.append_system("知識總長度接近上限，已部分截斷。")
+
+        intro = self._extract_intro_from_persona(persona_txt)
+        self._intro_template = intro
+        # 多組 few-shot（包含反例提問）
+        self._fewshot = [
+            {"role": "user", "content": "你是誰？"},
+            {"role": "assistant", "content": intro},
+            {"role": "user", "content": "你由誰開發？"},
+            {"role": "assistant", "content": "我是CG百貨的服務台小姐（虛擬助理），提供百貨賣場的導覽與服務資訊。"},
+            {"role": "user", "content": "你是 AI 嗎？"},
+            {"role": "assistant", "content": "我是CG百貨的服務台小姐（虛擬助理）。如果您需要樓層或服務資訊，我很樂意協助！"},
+        ]
+
+    # ---- 讀 persona.txt ----
+    def _load_persona_text(self) -> str:
+        if os.path.isfile(PERSONA_FILE):
+            try:
+                with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                if txt:
+                    self.append_system("已載入人設：persona.txt")
+                    return txt
+            except Exception as e:
+                self.append_system(f"⚠️ 無法讀取 persona.txt：{e}，改用預設人設。")
+        else:
+            self.append_system("⚠️ 找不到 persona.txt，改用預設人設。")
+        return FALLBACK_PERSONA
+
+    # ---- 從 persona 取自介模板 ----
+    def _extract_intro_from_persona(self, persona_txt: str) -> str:
+        m = re.search(r"【自我介紹模板】(.+?)(?:\n【|$)", persona_txt, flags=re.S)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        m = re.search(r"自我介紹模板[:：]\s*(.+)", persona_txt)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        return "您好，我是CG百貨的服務台小姐，很高興為您服務。請問想找哪個樓層或服務呢？"
+
+    # ---- 生成 ≤200字的核心人設片段（每回合都帶）----
+    def _make_short_persona(self, persona_txt: str) -> str:
+        # 取【角色】與【口吻】兩段，壓縮到 200 字以內
+        role = ""
+        tone = ""
+        m1 = re.search(r"【角色】(.+?)(?:\n【|$)", persona_txt, flags=re.S)
+        if m1: role = re.sub(r"\s+", " ", m1.group(1)).strip()
+        m2 = re.search(r"【口吻】(.+?)(?:\n【|$)", persona_txt, flags=re.S)
+        if m2: tone = re.sub(r"\s+", " ", m2.group(1)).strip()
+        base = f"你是百貨公司的服務台小姐。角色：{role}。口吻：{tone}。請勿自稱AI/大型語言模型/Google/OpenAI。"
+        return base[:200]
+
+    # ---- 讀取 knowledge/ 全部 .txt（排除 persona.txt）----
+    def _load_all_knowledge_texts(self):
+        paths = sorted(glob.glob(os.path.join(KNOWLEDGE_DIR, "*.txt")))
+        paths = [p for p in paths if os.path.abspath(p) != os.path.abspath(PERSONA_FILE)]
+        if not paths:
+            return None, []
+
+        total, pieces, used = 0, [], []
+        for p in paths:
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    raw = f.read()
+                if not raw.strip():
+                    continue
+                content = raw[:KNOWLEDGE_PER_FILE_MAX_CHARS].strip()
+                block = f"【來源：{os.path.basename(p)}】\n{content}\n"
+                blen = len(block)
+                if total + blen > KNOWLEDGE_TOTAL_MAX_CHARS:
+                    remain = KNOWLEDGE_TOTAL_MAX_CHARS - total
+                    if remain > 200:
+                        pieces.append(block[:remain])
+                        used.append(os.path.basename(p) + "（部分）")
+                        total = KNOWLEDGE_TOTAL_MAX_CHARS
+                    break
+                else:
+                    pieces.append(block)
+                    used.append(os.path.basename(p))
+                    total += blen
+            except Exception as e:
+                self.append_system(f"⚠️ 無法讀取：{p}（{e}），已略過。")
+
+        if not pieces:
+            return None, []
+        merged = "【樓層導覽知識集合（僅供回答依據）】\n" + "\n".join(pieces)
+        return merged, used
+
+    # ---- 開場主動自介（不呼叫模型）----
+    def _opening_greeting(self):
+        self.append_system("已準備人設與知識；以下是主動自介。")
+        self.append_assistant(self._intro_template)
+        self.history.append({"role": "assistant", "content": self._intro_template})
+
+    # ---- 每回合要送出的 payload ----
+    def _build_payload_messages(self):
+        payload = []
+        # 短版人設每回合必帶（黏著度高，負擔小）
+        payload.append({"role": "system", "content": self._short_persona})
+        # 長版（含知識）看設定：預設每回合帶
+        if ALWAYS_INCLUDE_CONTEXT:
+            payload.append({"role": "system", "content": self._base_system})
+        # few-shot 前綴
+        payload.extend(self._fewshot)
+        # 真實對話歷史
+        payload.extend(self.history)
+        return payload
+
+    # ---- 後處理：若漂移則修正 ----
+    def _guard_persona(self, text: str) -> str:
+        for pat in IDENTITY_DRIFT_PATTERNS:
+            if re.search(pat, text, flags=re.I):
+                # 用自介模板改寫第一句；其餘內容保留
+                rest = re.sub(r'^.*?[。.!?]\s*', '', text, count=1, flags=re.S)
+                fixed = self._intro_template
+                if rest.strip():
+                    fixed += ("\n\n" + rest.strip())
+                return fixed
+        return text
+
+    # ---- 送出訊息 ----
+    def on_send_clicked(self):
+        if self._busy:
+            return
+        user_text = self.input_edit.toPlainText().strip()
+        if not user_text:
+            return
+
+        self.append_user(user_text)
+        self.input_edit.clear()
+        self.history.append({"role": "user", "content": user_text})
+
+        payload = self._build_payload_messages()
+
+        self._busy = True
+        self.send_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
+
+        self._worker = ChatWorker(payload)
+        self._worker.finished.connect(self.on_reply_ready)
+        self._worker.failed.connect(self.on_reply_failed)
+        self._worker.finished.connect(self._cleanup_worker)
+        self._worker.failed.connect(self._cleanup_worker)
+        self._worker.start()
+
+    def _cleanup_worker(self, *_):
+        self._busy = False
+        self.send_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
+        self._worker = None
+
+    # ---- 收到回覆 ----
+    def on_reply_ready(self, answer: str):
+        answer = self._guard_persona(answer)
+        self.append_assistant(answer)
+        self.history.append({"role": "assistant", "content": answer})
+
+    # ---- 發生錯誤 ----
+    def on_reply_failed(self, err_text: str):
+        self.append_system("（⚠️ 發生錯誤，請檢查本機 API 是否啟動、模型名稱是否正確）")
+        dlg = QMessageBox(self)
+        dlg.setIcon(QMessageBox.Warning)
+        dlg.setWindowTitle("請求失敗")
+        dlg.setText("向模型請求失敗。")
+        dlg.setDetailedText(err_text)
+        dlg.exec()
+
+# ========== 進入點 ==========
+def main():
+    os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+    app = QApplication(sys.argv)
+    win = ChatWindow()
+    win.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
