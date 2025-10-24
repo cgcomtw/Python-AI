@@ -1,0 +1,235 @@
+import os, sys, subprocess, html, traceback
+
+# ---------- 自動安裝套件 ----------
+def ensure_package(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"未偵測到套件：{pkg}，正在安裝中...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        print(f"成功安裝 {pkg}\n")
+
+ensure_package("PySide6")
+ensure_package("openai")
+
+# ---------- 匯入套件 ----------
+from openai import OpenAI
+from PySide6.QtCore import Qt, QThread, Signal, QEvent
+from PySide6.QtGui import QAction, QKeySequence, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout,
+    QLabel, QMessageBox, QFileDialog
+)
+
+# ---------- Ollama / OpenAI 相容設定 ----------
+client = OpenAI(
+    base_url="http://127.0.0.1:11434/v1",  # Ollama 本機 API
+    api_key="ollama"                       # 形式上仍需填字串，但實際不檢查
+)
+MODEL = "gemma3:1b"
+
+# ---------- 預設系統提示 ----------
+DEFAULT_SYSTEM_PROMPT = (
+    "你是專業的中文助理，請全程使用繁體中文（台灣）回覆，"
+    "用詞與標點採台灣慣用法，除非明確要求其他語言或格式。"
+)
+
+# ========== 後台工作執行緒 ==========
+class ChatWorker(QThread):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, history, parent=None):
+        super().__init__(parent)
+        self._history = list(history)
+
+    def run(self):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=self._history,
+                temperature=0.7
+            )
+            answer = resp.choices[0].message.content
+            self.finished.emit(answer)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.failed.emit(f"{e}\n{tb}")
+
+# ========== 主視窗 ==========
+class ChatWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("本機 AI 聊天（PySide6 + Ollama/OpenAI API）")
+        self.resize(600, 800)
+
+        self.history = [
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+        ]
+
+        # 角色圖片區
+        self.avatar_label = QLabel("（尚未載入角色圖片）")
+        self.avatar_label.setAlignment(Qt.AlignCenter)
+        self.avatar_label.setFixedHeight(160)
+        self.avatar_label.setStyleSheet(
+            "border: 1px dashed #666; color: #888; font-size: 14px;"
+        )
+
+        # 對話顯示
+        self.chat_view = QTextEdit()
+        self.chat_view.setReadOnly(True)
+        self.chat_view.setPlaceholderText("這裡會顯示對話內容…")
+        self.chat_view.setStyleSheet("font-size: 14px;")
+
+        # 輸入區
+        self.input_edit = QTextEdit()
+        self.input_edit.setPlaceholderText("輸入訊息…（Enter 送出，Shift+Enter 換行）")
+        self.input_edit.setFixedHeight(120)
+        self.input_edit.setStyleSheet("font-size: 14px;")
+        self.input_edit.installEventFilter(self)  # 只監聽這個 widget
+
+        # 按鈕列
+        self.send_btn = QPushButton("送出")
+        self.clear_btn = QPushButton("清除對話")
+        self.load_img_btn = QPushButton("載入角色圖片…")
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.load_img_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addWidget(self.send_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.avatar_label)
+        layout.addWidget(self.chat_view, 1)
+        layout.addWidget(self.input_edit)
+        layout.addLayout(btn_row)
+
+        # Ctrl+Enter 送出
+        send_action = QAction(self)
+        send_action.setShortcut(QKeySequence(Qt.CTRL | Qt.Key_Return))
+        send_action.triggered.connect(self.on_send_clicked)
+        self.addAction(send_action)
+
+        # 事件連接
+        self.send_btn.clicked.connect(self.on_send_clicked)
+        self.clear_btn.clicked.connect(self.on_clear_clicked)
+        self.load_img_btn.clicked.connect(self.on_load_image)
+
+        self.append_system("已載入系統提示。開始對話吧！")
+
+        self._busy = False
+        self._worker = None
+
+    # ---- 事件過濾修正：使用 QEvent.KeyPress ----
+    def eventFilter(self, obj, event):
+        # 只處理 input_edit 的 KeyPress；其他一律交給父類
+        if obj is self.input_edit and event.type() == QEvent.KeyPress:
+            key = event.key()
+            mods = event.modifiers()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if mods & Qt.ShiftModifier:
+                    # Shift+Enter => 換行
+                    return False  # 讓系統照常插入換行
+                else:
+                    # Enter => 送出
+                    self.on_send_clicked()
+                    return True   # 已處理，阻止預設換行
+        return super().eventFilter(obj, event)
+
+    # ---- UI 輔助 ----
+    def append_user(self, text: str):
+        safe = html.escape(text).replace("\n", "<br>")
+        self.chat_view.append(f"<p><b>你：</b><br>{safe}</p>")
+        self.chat_view.verticalScrollBar().setValue(
+            self.chat_view.verticalScrollBar().maximum()
+        )
+
+    def append_assistant(self, text: str):
+        safe = html.escape(text).replace("\n", "<br>")
+        self.chat_view.append(f"<p style='color:#1a73e8;'><b>助理：</b><br>{safe}</p>")
+        self.chat_view.verticalScrollBar().setValue(
+            self.chat_view.verticalScrollBar().maximum()
+        )
+
+    def append_system(self, text: str):
+        safe = html.escape(text).replace("\n", "<br>")
+        self.chat_view.append(f"<p style='color:#888;'><i>{safe}</i></p>")
+
+    # ---- 載入角色圖片 ----
+    def on_load_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "選擇角色圖片", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
+        )
+        if path:
+            pix = QPixmap(path)
+            if pix.isNull():
+                QMessageBox.warning(self, "載入失敗", "無法讀取這張圖片。")
+                return
+            scaled = pix.scaledToHeight(150, Qt.SmoothTransformation)
+            self.avatar_label.setPixmap(scaled)
+            self.avatar_label.setText("")
+
+    # ---- 清除對話 ----
+    def on_clear_clicked(self):
+        self.chat_view.clear()
+        self.history = [
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+        ]
+        self.append_system("已清除對話。")
+
+    # ---- 送出訊息 ----
+    def on_send_clicked(self):
+        if self._busy:
+            return
+
+        user_text = self.input_edit.toPlainText().strip()
+        if not user_text:
+            return
+
+        self.append_user(user_text)
+        self.input_edit.clear()
+
+        self.history.append({"role": "user", "content": user_text})
+
+        self._busy = True
+        self.send_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
+
+        self._worker = ChatWorker(self.history)
+        self._worker.finished.connect(self.on_reply_ready)
+        self._worker.failed.connect(self.on_reply_failed)
+        self._worker.finished.connect(self._cleanup_worker)
+        self._worker.failed.connect(self._cleanup_worker)
+        self._worker.start()
+
+    def _cleanup_worker(self, *_):
+        self._busy = False
+        self.send_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
+        self._worker = None
+
+    # ---- 收到回覆 ----
+    def on_reply_ready(self, answer: str):
+        self.append_assistant(answer)
+        self.history.append({"role": "assistant", "content": answer})
+
+    # ---- 發生錯誤 ----
+    def on_reply_failed(self, err_text: str):
+        self.append_system("（⚠️ 發生錯誤，請檢查本機 API 是否啟動、模型名稱是否正確）")
+        dlg = QMessageBox(self)
+        dlg.setIcon(QMessageBox.Warning)
+        dlg.setWindowTitle("請求失敗")
+        dlg.setText("向模型請求失敗。")
+        dlg.setDetailedText(err_text)
+        dlg.exec()
+
+# ========== 進入點 ==========
+def main():
+    app = QApplication(sys.argv)
+    win = ChatWindow()
+    win.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
